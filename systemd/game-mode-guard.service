@@ -1,0 +1,21 @@
+[Unit]
+Description=Free GPU VRAM (evict local Ollama models) when a game launches
+Documentation=file:///home/yak/projects/local-model-routing/POLICY.md
+After=ollama.service
+
+[Service]
+Type=simple
+# Low priority so it can never compete with the game it is protecting.
+Nice=10
+CPUWeight=20
+IOSchedulingClass=idle
+ExecStart=/usr/bin/python3 %h/.hermes/scripts/game-mode-guard.py watch
+Restart=on-failure
+RestartSec=10
+# A guard that spins or leaks would violate the "no heavy background tasks"
+# rule, so cap it hard: the daemon does one /proc scan every 5s.
+MemoryMax=64M
+CPUQuota=10%
+
+[Install]
+WantedBy=default.target

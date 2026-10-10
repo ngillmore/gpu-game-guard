@@ -1,0 +1,14 @@
+# Byte-compiled / cache
+__pycache__/
+*.py[cod]
+*.egg-info/
+
+# State / logs produced at runtime
+*.log
+game-mode.json
+
+# Editor / OS
+.vscode/
+.idea/
+*.swp
+.DS_Store

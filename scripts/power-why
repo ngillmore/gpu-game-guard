@@ -1,0 +1,229 @@
+#!/bin/bash
+# power-why — "why is the UPS loaded?" in one command.
+#
+# Reads apcaccess LOADPCT (system-wide apparent load at the wall) and breaks it
+# down against the dynamic draws we can actually see: GPU, CPU package, top
+# processes, and resident local-AI VRAM. The UPS number is ALWAYS >= the sum of
+# the parts, because it counts the PSU conversion loss, the UPS inverter/float
+# overhead, monitors, the case screen, USB, fans and pumps. So the output
+# explains the load; it does not claim to account for every watt.
+#
+# Sibling to ~/.local/bin/apc-status (same formatting conventions).
+#
+# NOTE: the apcaccess field set is MODEL-SPECIFIC. BATTV/BATTDATE are absent on
+# this CyberPower CP1500PFCLCDa and a missing field makes grep exit 1, so every
+# optional read is guarded with `|| true` plus an :-N/A default. Do not add
+# `set -e` — it turns an absent field into silent death.
+
+# ---------- options ----------
+WATCH=0
+INTERVAL=5
+JSON=0
+while [ $# -gt 0 ]; do
+    case "$1" in
+        -w|--watch)
+            WATCH=1
+            if [ -n "$2" ] && [ "$2" -eq "$2" ] 2>/dev/null; then
+                INTERVAL="$2"; shift
+            fi
+            ;;
+        -j|--json) JSON=1 ;;
+        -h|--help)
+            cat <<'EOF'
+power-why — explain what is drawing power through the UPS
+
+Usage:
+  power-why                 one-shot breakdown
+  power-why --watch [secs]  live refresh (default 5s), Ctrl-C to stop
+  power-why --json          machine-readable summary
+
+Breaks apcaccess LOADPCT down against GPU / CPU / top processes / resident
+local-AI VRAM. The UPS figure also covers PSU loss, UPS float overhead,
+monitors, case screen and fans, so the parts never sum to the whole.
+EOF
+            exit 0
+            ;;
+        *) echo "power-why: unknown option '$1' (try --help)" >&2; exit 1 ;;
+    esac
+    shift
+done
+
+# ---------- helpers ----------
+hr()  { printf '  %s\n' "─────────────────────────────────────────────────────────"; }
+
+# nvidia-smi is optional; a box without it must degrade, not die.
+gpu_field() {  # $1 = query field
+    nvidia-smi --query-gpu="$1" --format=csv,noheader,nounits 2>/dev/null | head -1 | tr -d ' ' || true
+}
+
+# CPU package power via RAPL. Not all kernels/users expose it.
+cpu_power() {
+    local base=/sys/class/powercap/intel-rapl:0
+    local f=""
+    for cand in "$base/energy_uj" "$base/name"; do [ -r "$cand" ] || return 1; done
+    local e1 e2
+    e1=$(cat "$base/energy_uj" 2>/dev/null) || return 1
+    sleep 0.5
+    e2=$(cat "$base/energy_uj" 2>/dev/null) || return 1
+    [ -n "$e1" ] && [ -n "$e2" ] || return 1
+    # uJ over 0.5s -> W  =  (dE / 1e6) / 0.5
+    awk -v a="$e1" -v b="$e2" 'BEGIN{ d=b-a; if (d<0) d+=1000000000; printf "%.1f", (d/1000000)/0.5 }'
+}
+
+collect() {
+    # --- UPS ---
+    UPS_RAW=$(apcaccess status 2>/dev/null || true)
+    STATUS=$(printf '%s\n' "$UPS_RAW" | grep -E "^STATUS"    | awk '{print $3}'          || true)
+    LOADPCT=$(printf '%s\n' "$UPS_RAW" | grep -E "^LOADPCT"  | awk '{print $3}'          || true)
+    NOMPOWER=$(printf '%s\n' "$UPS_RAW" | grep -E "^NOMPOWER"| awk '{print $3}'          || true)
+    BCHARGE=$(printf '%s\n' "$UPS_RAW" | grep -E "^BCHARGE"  | awk '{print $3}'          || true)
+    TIMELEFT=$(printf '%s\n' "$UPS_RAW" | grep -E "^TIMELEFT"| awk '{print $3}'          || true)
+    STATUS=${STATUS:-UNKNOWN}; LOADPCT=${LOADPCT:-0.0}
+    NOMPOWER=${NOMPOWER:-1000}; BCHARGE=${BCHARGE:-N/A}; TIMELEFT=${TIMELEFT:-N/A}
+
+    LOAD_INT=${LOADPCT%.*}; NOM_INT=${NOMPOWER%.*}
+    if [ -n "$LOAD_INT" ] && [ -n "$NOM_INT" ]; then
+        WATTS=$(( LOAD_INT * NOM_INT / 100 ))
+    else
+        WATTS=0
+    fi
+
+    # --- GPU ---
+    # nvidia-smi csv strips spaces from the name; re-space for display only.
+    GPU_NAME=$(gpu_field name | sed -E 's/(NVIDIA)(GeForce)(RTX)([0-9]+)/\1 \2 \3 \4/')
+    GPU_W=$(gpu_field power.draw)
+    GPU_UTIL=$(gpu_field utilization.gpu)
+    GPU_MEM_USED=$(gpu_field memory.used)
+    GPU_MEM_TOTAL=$(gpu_field memory.total)
+    GPU_TEMP=$(gpu_field temperature.gpu)
+
+    # --- resident local AI (what keeps the GPU off its deep-idle floor) ---
+    # `ollama ps` columns are whitespace-padded with a two-word PROCESSOR
+    # ("100% GPU") and a variable-width UNTIL ("Forever" / "4 minutes from
+    # now"), so shell field-splitting mangles them. Parse with a regex instead.
+    OLLAMA_SUMMARY=$(ollama ps 2>/dev/null | tail -n +2 | python3 -c '
+import re, sys
+rows = []
+for line in sys.stdin:
+    line = line.rstrip("\n")
+    if not line.strip():
+        continue
+    m = re.match(r"^(\S+)\s+(\S+)\s+(\S+\s+\S+)\s+(\d+%\s+\S+)\s+(\d+)\s+(.*)$", line)
+    if m:
+        name, _id, size, proc, ctx, until = m.groups()
+        rows.append(f"{name} ({size}, {proc}, ctx {ctx}, until {until.strip()})")
+    else:
+        rows.append(line.strip())
+print("; ".join(rows))
+' || true)
+    COMFY=$(systemctl --user is-active comfyui 2>/dev/null || true)
+
+    # --- CPU ---
+    LOADAVG=$(cut -d' ' -f1-3 /proc/loadavg 2>/dev/null || true)
+    CORES=$(nproc 2>/dev/null || echo '?')
+    CPU_PKG_W=$(cpu_power || true)
+
+    # --- top processes by CPU ---
+    TOP_PROCS=$(ps -eo pcpu,pmem,comm --sort=-pcpu 2>/dev/null | head -6 || true)
+
+    # --- top VRAM consumers ---
+    TOP_VRAM=$(nvidia-smi --query-compute-apps=pid,process_name,used_memory \
+                 --format=csv,noheader,nounits 2>/dev/null | head -5 || true)
+}
+
+render() {
+    if [ "$JSON" -eq 1 ]; then
+        python3 - "$WATTS" "$LOADPCT" "$NOMPOWER" "$STATUS" "$BCHARGE" "$TIMELEFT" \
+                    "$GPU_NAME" "$GPU_W" "$GPU_UTIL" "$GPU_MEM_USED" "$GPU_MEM_TOTAL" "$GPU_TEMP" \
+                    "$CPU_PKG_W" "$LOADAVG" "$CORES" "$OLLAMA_SUMMARY" "$COMFY" "$TOP_VRAM" "$TOP_PROCS" <<'PY'
+import json, sys
+(a, lo, nom, st, bc, tl, gn, gw, gu, gmu, gmt, gt, cw, la, co, ol, cf, tv, tp) = sys.argv[1:20]
+def num(x):
+    try: return float(x)
+    except Exception: return None
+print(json.dumps({
+    "ups": {"watts": int(a), "loadpct": num(lo), "nompower": int(nom),
+            "status": st, "bcharge": num(bc), "timeleft_min": num(tl)},
+    "gpu": {"name": gn or None, "power_w": num(gw), "util_pct": num(gu),
+            "vram_used_mib": num(gmu), "vram_total_mib": num(gmt), "temp_c": num(gt)},
+    "cpu": {"package_w": num(cw), "loadavg": la, "cores": co},
+    "local_ai": {"ollama_resident": ol or None, "comfyui": cf or None},
+    "top_vram": [l for l in tv.splitlines() if l.strip()],
+    "top_cpu_processes": [l for l in tp.splitlines() if l.strip()],
+}, indent=2))
+PY
+        return
+    fi
+
+    echo -e "\e[1;36m┌────────────────────────────────────────────────────────┐\e[0m"
+    echo -e "\e[1;36m│            ⚡ Why is the UPS loaded?                   │\e[0m"
+    echo -e "\e[1;36m└────────────────────────────────────────────────────────┘\e[0m"
+
+    if [ "$STATUS" = "ONLINE" ]; then
+        echo -e "  \e[1;32mUPS:\e[0m     \e[1;32mONLINE\e[0m  \e[1;33m${WATTS} W\e[0m (${LOADPCT}% of ${NOMPOWER}W) · batt ${BCHARGE}% · ${TIMELEFT} min left"
+    else
+        echo -e "  \e[1;32mUPS:\e[0m     \e[1;31m${STATUS}\e[0m  \e[1;33m${WATTS} W\e[0m (${LOADPCT}% of ${NOMPOWER}W) · batt ${BCHARGE}% · ${TIMELEFT} min left"
+    fi
+    hr
+
+    # GPU
+    if [ -n "$GPU_NAME" ]; then
+        printf '  \e[1;32mGPU:\e[0m     %s\n' "$GPU_NAME"
+        printf '           \e[1;33m%s W\e[0m · util %s%% · %s C · VRAM %s/%s MiB\n' \
+               "${GPU_W:-?}" "${GPU_UTIL:-?}" "${GPU_TEMP:-?}" "${GPU_MEM_USED:-?}" "${GPU_MEM_TOTAL:-?}"
+    else
+        printf '  \e[1;32mGPU:\e[0m     \e[2mno nvidia-smi\e[0m\n'
+    fi
+
+    # CPU
+    printf '  \e[1;32mCPU:\e[0m     %s cores · load %s\n' "${CORES:-?}" "${LOADAVG:-?}"
+    if [ -n "$CPU_PKG_W" ]; then
+        printf '           package \e[1;33m%s W\e[0m\n' "$CPU_PKG_W"
+    else
+        printf '           \e[2mpackage power: not exposed (needs CAP_SYS_ADMIN/RAPL)\e[0m\n'
+    fi
+    hr
+
+    # Local AI residency — usually the biggest AVOIDABLE dynamic draw
+    printf '  \e[1;32mLocal AI:\e[0m\n'
+    if [ -n "$OLLAMA_SUMMARY" ]; then
+        printf '           \e[1;33mresident:\e[0m %s\n' "$OLLAMA_SUMMARY"
+        printf '           \e[2munload: ollama stop <model>\e[0m\n'
+    else
+        printf '           \e[2mno ollama model resident\e[0m\n'
+    fi
+    printf '           comfyui: %s\n' "${COMFY:-unknown}"
+
+    if [ -n "$TOP_VRAM" ]; then
+        hr
+        printf '  \e[1;32mTop VRAM:\e[0m\n'
+        printf '%s\n' "$TOP_VRAM" | while IFS= read -r line; do
+            printf '           %s\n' "$line"
+        done
+    fi
+
+    hr
+    printf '  \e[1;32mTop CPU:\e[0m\n'
+    printf '%s\n' "$TOP_PROCS" | while IFS= read -r line; do
+        [ -n "$line" ] && printf '           %s\n' "$line"
+    done
+
+    echo -e "\e[2m  Note: the UPS figure also covers PSU conversion loss, UPS float\e[0m"
+    echo -e "\e[2m  overhead, monitors, case screen, USB, fans and pumps — the visible\e[0m"
+    echo -e "\e[2m  parts never sum to the whole. A high figure with every process idle\e[0m"
+    echo -e "\e[2m  is normal for a loaded desktop; look for a runaway draw, not a sum.\e[0m"
+}
+
+if [ "$WATCH" -eq 1 ]; then
+    trap 'echo; exit 0' INT TERM
+    while :; do
+        clear 2>/dev/null || true
+        collect
+        render
+        printf '\e[2m  refresh %ss · Ctrl-C to stop · %s\e[0m\n' "$INTERVAL" "$(date '+%H:%M:%S')"
+        sleep "$INTERVAL"
+    done
+else
+    collect
+    render
+fi
